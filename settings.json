@@ -1,10 +1,1 @@
-{
-  "scraping_mode": "playButton",
-  "enable_voice_transcription": false,
-  "use_cli_as_otp": false,
-  "enable_translation": false,
-  "refresh_interval_minutes": 20,
-  "audio_transcription_retries": 3,
-  "audio_download_delay_seconds": 30,
-  "headless": false
-}
+{"enable_voice_transcription": true, "audio_transcription_retries": 3, "audio_download_delay_seconds": 14}
