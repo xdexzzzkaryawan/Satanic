@@ -34,8 +34,8 @@ if not BOT_TOKEN:
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 LOGIN_URL = 'https://www.orangecarrier.com/login'
 LIVE_CALLS_URL = 'https://www.orangecarrier.com/live/calls'
-USERNAME = os.getenv('ORANGE_EMAIL', '')
-PASSWORD = os.getenv('ORANGE_PASSWORD', '')
+ORANGE_EMAIL = os.getenv('ORANGE_EMAIL', '')
+ORANGE_PASSWORD = os.getenv('ORANGE_PASSWORD', '')
 ORANGE_COOKIE = os.getenv('ORANGE_COOKIE', '')
 ORANGE_USER_AGENT = os.getenv('ORANGE_USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)')
 DEVELOPER_NAME = os.getenv('DEVELOPER_NAME', 'Bot Developer')
@@ -63,8 +63,11 @@ bot_settings = {
 
 COUNTRY_NAME_TO_CODE = {
     'INDONESIA': 'ID', 'UNITED STATES': 'US', 'UNITED KINGDOM': 'GB', 'RUSSIA': 'RU', 'CHINA': 'CN'
-    # (shortened mapping for brevity) add more if needed
 }
+
+# Global authenticated session (requests.Session)
+session = None
+session_lock = asyncio.Lock()
 
 # Helpers
 
@@ -142,7 +145,7 @@ def get_country_flag(country_name):
         return '🌍'
 
 
-# Networking helpers (direct requests using ORANGE_COOKIE)
+# Networking helpers (direct requests using requests.Session)
 
 def get_auth_headers():
     headers = {
@@ -156,11 +159,85 @@ def get_auth_headers():
     return headers
 
 
-def fetch_calls_direct():
-    """Fetch live calls table via requests and parse audio URLs."""
-    headers = get_auth_headers()
+def create_session_via_login(max_attempts=2):
+    """Attempt to log in using ORANGE_EMAIL / ORANGE_PASSWORD and return an authenticated requests.Session or None."""
+    if not ORANGE_EMAIL or not ORANGE_PASSWORD:
+        logger.info('ORANGE_EMAIL/ORANGE_PASSWORD not set; skipping automatic login')
+        return None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            s = requests.Session()
+            s.headers.update(get_auth_headers())
+            # GET login page to collect possible hidden fields
+            r = s.get(LOGIN_URL, timeout=20)
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, 'html.parser')
+            payload = {}
+            form = soup.find('form')
+            if form:
+                # collect hidden inputs
+                for inp in form.find_all('input'):
+                    name = inp.get('name')
+                    if not name:
+                        continue
+                    val = inp.get('value', '')
+                    payload[name] = val
+                action = form.get('action') or LOGIN_URL
+            else:
+                action = LOGIN_URL
+            # set credentials (common field names)
+            # try common names: email / username, password
+            # Overwrite or set these keys
+            # If form uses different names, this might fail (fallback to cookie env)
+            payload.update({'email': ORANGE_EMAIL, 'username': ORANGE_EMAIL, 'password': ORANGE_PASSWORD})
+            login_url = requests.compat.urljoin(LOGIN_URL, action)
+            post = s.post(login_url, data=payload, timeout=20, allow_redirects=True)
+            # verify by fetching live calls page
+            test = s.get(LIVE_CALLS_URL, timeout=20)
+            if test.status_code == 200 and 'LiveCalls' in test.text:
+                logger.info('Login via requests succeeded')
+                return s
+            else:
+                logger.warning(f'Login attempt {attempt} may have failed (status {test.status_code})')
+        except Exception as e:
+            logger.warning(f'Login attempt {attempt} error: {e}')
+        time.sleep(2 * attempt)
+    logger.error('Automatic login via requests failed')
+    return None
+
+
+def ensure_session():
+    """Ensure global session is available by trying automatic login; fallback to headers with ORANGE_COOKIE."""
+    global session
+    # Double-checked locking style
+    if session is not None:
+        return session
+    # create session in background thread (blocking) to avoid event loop issues
+    s = create_session_via_login()
+    if s:
+        session = s
+        return session
+    # fallback: create session with only headers (cookie) if ORANGE_COOKIE provided
+    if ORANGE_COOKIE:
+        sess = requests.Session()
+        sess.headers.update(get_auth_headers())
+        session = sess
+        logger.info('Using ORANGE_COOKIE fallback for session')
+        return session
+    logger.error('No authenticated session available (set ORANGE_EMAIL/PASSWORD or ORANGE_COOKIE)')
+    return None
+
+
+def fetch_calls_direct(use_session=True):
+    """Fetch live calls table via requests and parse audio URLs. Returns list of call dicts."""
     try:
-        r = requests.get(LIVE_CALLS_URL, headers=headers, timeout=30)
+        s = None
+        if use_session:
+            s = ensure_session()
+        if s:
+            r = s.get(LIVE_CALLS_URL, timeout=30)
+        else:
+            r = requests.get(LIVE_CALLS_URL, headers=get_auth_headers(), timeout=30)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, 'html.parser')
         tbody = soup.find('tbody', id='LiveCalls')
@@ -199,10 +276,15 @@ def fetch_calls_direct():
 
 
 def download_audio_direct(url, filename_base, retries=5, delay=5):
+    """Download file (mp4/mp3) via requests using authenticated session if available."""
+    s = session or None
     headers = get_auth_headers()
     for attempt in range(1, retries + 1):
         try:
-            r = requests.get(url, headers=headers, timeout=60, stream=True)
+            if s:
+                r = s.get(url, timeout=60, stream=True)
+            else:
+                r = requests.get(url, headers=headers, timeout=60, stream=True)
             r.raise_for_status()
             tmp_path = filename_base + '.download'
             with open(tmp_path, 'wb') as f:
@@ -255,7 +337,8 @@ async def process_call_worker(call_data, context: ContextTypes.DEFAULT_TYPE):
 
         temp_base = f'temp_audio_{int(time.time())}'
         await asyncio.sleep(bot_settings.get('audio_download_delay_seconds', 5))
-        # blocking download; run in thread to avoid blocking event loop
+        # ensure session (may perform login); run in thread
+        await asyncio.to_thread(ensure_session)
         downloaded_path = await asyncio.to_thread(download_audio_direct, audio_url, temp_base, 5, 5)
 
         if downloaded_path:
@@ -271,30 +354,42 @@ async def process_call_worker(call_data, context: ContextTypes.DEFAULT_TYPE):
                             extracted_audio = mp3_out
                     # send video first (whole mp4)
                     for chat_id in approved_chat_ids:
-                        try:
-                            with open(downloaded_path, 'rb') as vf:
-                                input_video = InputFile(vf, filename=os.path.basename(downloaded_path))
-                                await context.bot.send_video(chat_id=chat_id, video=input_video, caption=f"✨ New Call » {processed_country} » {masked_num}", parse_mode='MarkdownV2', supports_streaming=True)
-                        except Exception as e:
-                            logger.error(f'Failed to send video to {chat_id}: {e}')
+                        for attempt in range(3):
+                            try:
+                                with open(downloaded_path, 'rb') as vf:
+                                    input_video = InputFile(vf, filename=os.path.basename(downloaded_path))
+                                    await context.bot.send_video(chat_id=chat_id, video=input_video, caption=f"✨ New Call » {processed_country} » {masked_num}", parse_mode='MarkdownV2', supports_streaming=True)
+                                break
+                            except Exception as e:
+                                logger.error(f'Failed to send video to {chat_id} (attempt {attempt+1}): {e}')
+                                if attempt < 2:
+                                    await asyncio.sleep(2)
                     # if extracted audio exists send as audio
                     if extracted_audio:
                         for chat_id in approved_chat_ids:
-                            try:
-                                with open(extracted_audio, 'rb') as af:
-                                    input_audio = InputFile(af, filename=os.path.basename(extracted_audio))
-                                    await context.bot.send_audio(chat_id=chat_id, audio=input_audio, caption=f"🔊 Audio extracted for {masked_num}")
-                            except Exception as e:
-                                logger.error(f'Failed to send extracted audio to {chat_id}: {e}')
+                            for attempt in range(3):
+                                try:
+                                    with open(extracted_audio, 'rb') as af:
+                                        input_audio = InputFile(af, filename=os.path.basename(extracted_audio))
+                                        await context.bot.send_audio(chat_id=chat_id, audio=input_audio, caption=f"🔊 Audio extracted for {masked_num}", parse_mode='MarkdownV2')
+                                    break
+                                except Exception as e:
+                                    logger.error(f'Failed to send extracted audio to {chat_id} (attempt {attempt+1}): {e}')
+                                    if attempt < 2:
+                                        await asyncio.sleep(2)
                 else:
                     # audio-only file
                     for chat_id in approved_chat_ids:
-                        try:
-                            with open(downloaded_path, 'rb') as af:
-                                input_audio = InputFile(af, filename=os.path.basename(downloaded_path))
-                                await context.bot.send_audio(chat_id=chat_id, audio=input_audio, caption=f"✨ New Call » {processed_country} » {masked_num}")
-                        except Exception as e:
-                            logger.error(f'Failed to send audio to {chat_id}: {e}')
+                        for attempt in range(3):
+                            try:
+                                with open(downloaded_path, 'rb') as af:
+                                    input_audio = InputFile(af, filename=os.path.basename(downloaded_path))
+                                    await context.bot.send_audio(chat_id=chat_id, audio=input_audio, caption=f"✨ New Call » {processed_country} » {masked_num}", parse_mode='MarkdownV2')
+                                break
+                            except Exception as e:
+                                logger.error(f'Failed to send audio to {chat_id} (attempt {attempt+1}): {e}')
+                                if attempt < 2:
+                                    await asyncio.sleep(2)
 
                 # transcription if requested and audio available
                 audio_for_transcription = extracted_audio if extracted_audio else (downloaded_path if downloaded_path.lower().endswith('.mp3') else None)
@@ -340,6 +435,8 @@ async def process_call_worker(call_data, context: ContextTypes.DEFAULT_TYPE):
 async def monitor_calls(context: ContextTypes.DEFAULT_TYPE):
     if bot_settings['scraping_mode'] != 'playButton':
         return
+    # Ensure we have session available (login if needed)
+    await asyncio.to_thread(ensure_session)
     calls = await asyncio.to_thread(fetch_calls_direct)
     if calls:
         for call_data in calls:
@@ -402,7 +499,7 @@ async def post_init(app):
     # send startup message to admins
     for aid in list(admin_ids):
         try:
-            await app.bot.send_message(chat_id=aid, text='Bot started (no Selenium mode)')
+            await app.bot.send_message(chat_id=aid, text='Bot started (auto-login enabled)')
         except Exception as e:
             logger.error(f'Failed to send startup to {aid}: {e}')
 
@@ -412,7 +509,6 @@ def main():
     load_approved_chats()
     load_admin_ids()
 
-    job_queue = None
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler('start', cmd_start))
     app.add_handler(CommandHandler('status', cmd_status))
